@@ -70,7 +70,9 @@ def validate_nonstreaming(config, data_processor, model, test_set):
     metrics["ambient_false_positives_per_hour"] = 0
     metrics["average_viable_recall"] = 0
 
-    test_set_fp = result["fp"].numpy()
+    # tp/fp/tn/fn are compiled with thresholds=cutoffs (101 entries), so these
+    # are PER-CUTOFF arrays, not scalars. Keep them as arrays.
+    test_set_fp = np.asarray(result["fp"])
 
     if data_processor.get_mode_size("validation_ambient") > 0:
         (
@@ -100,68 +102,103 @@ def validate_nonstreaming(config, data_processor, model, test_set):
         )
 
         # Other than the false positive rate, all other metrics are accumulated across
-        # both test sets
-        all_true_positives = ambient_predictions["tp"].numpy()
-        ambient_false_positives = ambient_predictions["fp"].numpy() - test_set_fp
-        all_false_negatives = ambient_predictions["fn"].numpy()
+        # both test sets. These remain PER-CUTOFF arrays (length 101).
+        all_true_positives = np.asarray(ambient_predictions["tp"])
+        ambient_false_positives = np.asarray(ambient_predictions["fp"]) - test_set_fp
+        all_false_negatives = np.asarray(ambient_predictions["fn"])
 
         metrics["auc"] = ambient_predictions["auc"]
         metrics["loss"] = ambient_predictions["loss"]
 
-        recall_at_cutoffs = (
-            all_true_positives / (all_true_positives + all_false_negatives)
-        )
-        faph_at_cutoffs = ambient_false_positives / duration_of_ambient_set
+        try:
+            recall_at_cutoffs = all_true_positives / (
+                all_true_positives + all_false_negatives + 1e-9
+            )
+            faph_at_cutoffs = ambient_false_positives / max(
+                duration_of_ambient_set, 1e-9
+            )
 
-        target_faph_cutoff_probability = 1.0
-        for index, cutoff in enumerate(np.linspace(0.0, 1.0, 101)):
-            if faph_at_cutoffs[index] == 0:
-                target_faph_cutoff_probability = cutoff
-                recall_at_no_faph = recall_at_cutoffs[index]
-                break
+            # Defensive only: if a degenerate scalar slips through, broadcast it
+            # so downstream indexing does not crash. Under normal operation these
+            # are already length-101 arrays.
+            recall_at_cutoffs = np.atleast_1d(recall_at_cutoffs)
+            faph_at_cutoffs = np.atleast_1d(faph_at_cutoffs)
+            if recall_at_cutoffs.shape[0] == 1:
+                recall_at_cutoffs = np.full(101, float(recall_at_cutoffs[0]))
+            if faph_at_cutoffs.shape[0] == 1:
+                faph_at_cutoffs = np.full(101, float(faph_at_cutoffs[0]))
 
-        if faph_at_cutoffs[0] > 2:
-            # Use linear interpolation to estimate recall at 2 faph
+            n_cutoffs = len(faph_at_cutoffs)
 
-            # Increase index until we find a faph less than 2
-            index_of_first_viable = 1
-            while faph_at_cutoffs[index_of_first_viable] > 2:
-                index_of_first_viable += 1
+            target_faph_cutoff_probability = 1.0
+            recall_at_no_faph = 0.0
+            for index, cutoff in enumerate(np.linspace(0.0, 1.0, n_cutoffs)):
+                if faph_at_cutoffs[index] == 0:
+                    target_faph_cutoff_probability = cutoff
+                    recall_at_no_faph = recall_at_cutoffs[index]
+                    break
 
-            x0 = faph_at_cutoffs[index_of_first_viable - 1]
-            y0 = recall_at_cutoffs[index_of_first_viable - 1]
-            x1 = faph_at_cutoffs[index_of_first_viable]
-            y1 = recall_at_cutoffs[index_of_first_viable]
+            if faph_at_cutoffs[0] > 2:
+                # Use linear interpolation to estimate recall at 2 faph.
+                index_of_first_viable = 1
+                while (
+                    index_of_first_viable < n_cutoffs - 1
+                    and faph_at_cutoffs[index_of_first_viable] > 2
+                ):
+                    index_of_first_viable += 1
 
-            recall_at_2faph = (y0 * (x1 - 2.0) + y1 * (2.0 - x0)) / (x1 - x0)
-        else:
-            # Lowest faph is already under 2, assume the recall is constant before this
-            index_of_first_viable = 0
-            recall_at_2faph = recall_at_cutoffs[0]
+                x0 = faph_at_cutoffs[index_of_first_viable - 1]
+                y0 = recall_at_cutoffs[index_of_first_viable - 1]
+                x1 = faph_at_cutoffs[index_of_first_viable]
+                y1 = recall_at_cutoffs[index_of_first_viable]
 
-        x_coordinates = [2.0]
-        y_coordinates = [recall_at_2faph]
+                if x1 != x0:
+                    recall_at_2faph = (y0 * (x1 - 2.0) + y1 * (2.0 - x0)) / (x1 - x0)
+                else:
+                    recall_at_2faph = float(y0)
+            else:
+                # Lowest faph is already under 2.
+                index_of_first_viable = 0
+                recall_at_2faph = float(recall_at_cutoffs[0])
 
-        for index in range(index_of_first_viable, len(recall_at_cutoffs)):
-            if faph_at_cutoffs[index] != x_coordinates[-1]:
-                # Only add a point if it is a new faph
-                # This ensures if a faph rate is repeated, we use the highest recall
-                x_coordinates.append(faph_at_cutoffs[index])
-                y_coordinates.append(recall_at_cutoffs[index])
+            x_coordinates = [2.0]
+            y_coordinates = [recall_at_2faph]
 
-        # Use trapezoid rule to estimate the area under the curve, then divide by 2.0 to get the average recall
-        average_viable_recall = (
-            np.trapz(np.flip(y_coordinates), np.flip(x_coordinates)) / 2.0
-        )
+            for index in range(index_of_first_viable, len(recall_at_cutoffs)):
+                if faph_at_cutoffs[index] != x_coordinates[-1]:
+                    # Only add a point if it is a new faph; if a faph rate is
+                    # repeated we keep the highest recall (first seen).
+                    x_coordinates.append(float(faph_at_cutoffs[index]))
+                    y_coordinates.append(float(recall_at_cutoffs[index]))
 
-        metrics["recall_at_no_faph"] = recall_at_no_faph
-        metrics["cutoff_for_no_faph"] = target_faph_cutoff_probability
-        metrics["ambient_false_positives"] = ambient_false_positives[50]
-        metrics["ambient_false_positives_per_hour"] = faph_at_cutoffs[50]
-        metrics["average_viable_recall"] = average_viable_recall
+            # Trapezoid AUC of the viable (faph<=2) ROC region, normalized by 2.0
+            # to express it as an average recall. numpy 2.x: trapezoid (no trapz).
+            average_viable_recall = (
+                np.trapezoid(np.flip(y_coordinates), np.flip(x_coordinates)) / 2.0
+            )
+
+            # Index 50 == cutoff 0.50 on the 101-point grid.
+            mid = min(50, n_cutoffs - 1)
+            metrics["recall_at_no_faph"] = float(recall_at_no_faph)
+            metrics["cutoff_for_no_faph"] = float(target_faph_cutoff_probability)
+            metrics["ambient_false_positives"] = float(ambient_false_positives.flat[mid])
+            metrics["ambient_false_positives_per_hour"] = float(faph_at_cutoffs[mid])
+            metrics["average_viable_recall"] = float(average_viable_recall)
+        except Exception as e:
+            # No usable ambient sweep — fall back to recall as a proxy so the
+            # checkpoint selector still has a monotone signal to chase.
+            metrics["recall_at_no_faph"] = float(metrics.get("recall", 0))
+            metrics["cutoff_for_no_faph"] = 1.0
+            metrics["ambient_false_positives"] = 0.0
+            metrics["ambient_false_positives_per_hour"] = 0.0
+            metrics["average_viable_recall"] = float(metrics.get("recall", 0))
+            import logging as _log
+
+            _log.warning(
+                f"Ambient metrics skipped (no ambient set or sweep error): {e}"
+            )
 
     return metrics
-
 
 def train(model, config, data_processor):
     # Assign default training settings if not set in the configuration yaml
