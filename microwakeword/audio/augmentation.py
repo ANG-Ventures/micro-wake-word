@@ -26,7 +26,7 @@ class Augmentation:
 
     Args:
         augmentation_duration_s (float): The duration of the augmented clip in seconds.
-        augmentation_probabilities (dict, optional): Dictionary that specifies each augmentation's probability of being applied. Defaults to { "SevenBandParametricEQ": 0.0, "TanhDistortion": 0.0, "PitchShift": 0.0, "BandStopFilter": 0.0, "AddColorNoise": 0.25, "AddBackgroundNoise": 0.75, "Gain": 1.0, "GainTransition": 0.25, "RIR": 0.5, }.
+        augmentation_probabilities (dict, optional): Dictionary that specifies each augmentation's probability of being applied. Defaults to { "SevenBandParametricEQ": 0.0, "TanhDistortion": 0.0, "PitchShift": 0.0, "BandStopFilter": 0.0, "AddGaussianNoise": 0.25, "AddBackgroundNoise": 0.75, "Gain": 1.0, "GainTransition": 0.25, "RIR": 0.5, }.
         impulse_paths (List[str], optional): List of directory paths that contain room impulse responses that the audio clip is reverberated with. If the list is empty, then reverberation is not applied. Defaults to [].
         background_paths (List[str], optional): List of directory paths that contain audio clips to be mixed into the audio clip. If the list is empty, then the background augmentation is not applied. Defaults to [].
         background_min_snr_db (int, optional): The minimum signal to noise ratio for mixing in background audio. Defaults to -10.
@@ -48,7 +48,7 @@ class Augmentation:
             "TanhDistortion": 0.0,
             "PitchShift": 0.0,
             "BandStopFilter": 0.0,
-            "AddColorNoise": 0.25,
+            "AddGaussianNoise": 0.25,
             "AddBackgroundNoise": 0.75,
             "Gain": 1.0,
             "GainTransition": 0.25,
@@ -133,10 +133,10 @@ class Augmentation:
                 audiomentations.BandStopFilter(
                     p=augmentation_probabilities.get("BandStopFilter", 0.0),
                 ),
-                audiomentations.AddColorNoise(
-                    p=augmentation_probabilities.get("AddColorNoise", 0.0),
-                    min_snr_db=color_min_snr_db,
-                    max_snr_db=color_max_snr_db,
+                audiomentations.AddGaussianNoise(
+                    p=augmentation_probabilities.get("AddGaussianNoise", 0.0),
+                    min_amplitude=0.001,
+                    max_amplitude=0.015,
                 ),
                 background_noise_augment,
                 audiomentations.Gain(
