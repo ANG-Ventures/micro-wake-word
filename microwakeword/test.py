@@ -373,6 +373,19 @@ def tflite_streaming_model_roc(
             positive_sample_streaming_probabilities.append(np.max(moving_average))
 
     # Compute the false negative rates at each cutoff
+    # GUARD (ANG fork): if there are zero positive samples in the testing
+    # split, skip the streaming ROC eval rather than crashing. This bug
+    # manifested as ZeroDivisionError at this line for clean-corpus configs
+    # whose testing split had no positives. The model + TFLite have already
+    # been exported by this point; the wrapper pipeline should fall through
+    # to its own real-recall eval instead.
+    if len(positive_sample_streaming_probabilities) == 0:
+        import logging
+        logging.warning(
+            'tflite_streaming_model_roc: testing split has 0 positive samples; '
+            'skipping streaming ROC eval. Model + TFLite are unaffected.'
+        )
+        return  # nothing to write; pipeline should consume the existing TFLite
     false_negative_rate_at_cutoffs = []
     for cutoff in cutoffs:
         true_accepts = sum(i > cutoff for i in positive_sample_streaming_probabilities)
